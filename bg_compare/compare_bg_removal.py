@@ -33,6 +33,7 @@ import argparse
 import csv
 import gc
 import html
+import json
 import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
@@ -336,7 +337,6 @@ render();
 
 
 def write_rate_page(out_dir: Path, stems: List[str], models: List[str]) -> None:
-    import json
     data = json.dumps({"cuts": stems, "models": models}, ensure_ascii=False)
     (out_dir / "rate.html").write_text(RATE_PAGE.replace("__DATA__", data), encoding="utf-8")
 
@@ -348,7 +348,7 @@ def main() -> None:
     parser.add_argument("--input", required=True, help="비교할 이미지 폴더(또는 이미지 파일 하나)")
     parser.add_argument("--output", required=True, help="결과 폴더")
     parser.add_argument("--models", default="inspyrenet,birefnet",
-                        help="쉼표로 구분: inspyrenet, birefnet, birefnet_hr, toonout")
+                        help="쉼표로 구분(목록은 파일 맨 위 설명, 뒤에 +tta 가능)")
     parser.add_argument("--device", default="auto", help="auto | cuda | mps | cpu")
     parser.add_argument("--blur-sigma", type=float, default=1.5, help="워커 후처리와 같은 값(서버 기본 1.5, 0이면 이진화)")
     parser.add_argument("--inspyrenet-mode", default="base", help="워커 기본 base")
@@ -357,6 +357,7 @@ def main() -> None:
     parser.add_argument("--no-fp16", dest="fp16", action="store_false", help="BiRefNet을 fp32로(기본은 CUDA에서 fp16 — 예전 워커와 같음)")
     parser.add_argument("--warmup", type=int, default=1, help="시간 측정 전 예열 횟수(첫 실행의 초기화 시간을 빼려고)")
     parser.add_argument("--thumb", type=int, default=640, help="비교 시트의 칸 크기(긴 변 px)")
+    parser.add_argument("--rerun", action="store_true", help="같은 --output에 이미 끝난 모델도 다시 돌린다")
     args = parser.parse_args()
 
     models = [m.strip() for m in args.models.split(",") if m.strip()]
@@ -365,8 +366,14 @@ def main() -> None:
     unknown = [m for m in models if m not in loaders]
     if unknown:
         parser.error(f"모르는 모델: {unknown} (가능: {list(loaders)})")
-    if any(m.startswith("toonout") for m in models) and not args.toonout_weights:
-        parser.error("toonout을 비교하려면 --toonout-weights가 필요합니다")
+    if any(m.startswith("toonout") for m in models):
+        if not args.toonout_weights:
+            parser.error("toonout을 비교하려면 --toonout-weights가 필요합니다")
+        # 앞 모델을 다 돌린 뒤에야 파일이 없다고 실패하지 않게 미리 확인한다
+        if not Path(args.toonout_weights).is_file():
+            parser.error(f"ToonOut 가중치 파일이 없습니다: {Path(args.toonout_weights).resolve()}")
+    if args.inspyrenet_ckpt and not Path(args.inspyrenet_ckpt).is_file():
+        parser.error(f"InSPyReNet 가중치 파일이 없습니다: {Path(args.inspyrenet_ckpt).resolve()}")
 
     src = Path(args.input)
     images = [src] if src.is_file() else sorted(p for p in src.iterdir() if p.suffix.lower() in IMAGE_EXTS)
@@ -383,8 +390,21 @@ def main() -> None:
     times: Dict[str, Dict[Path, float]] = {}
     peak_mem: Dict[str, Optional[float]] = {}
 
-    # 모델을 하나씩 올렸다 내려 GPU 메모리를 서로 나눠 쓰지 않게 한다
+    # 모델을 하나씩 올렸다 내려 GPU 메모리를 서로 나눠 쓰지 않게 한다. 모델이 끝날 때마다 마스크·시간을 바로 저장해,
+    # 중간에 실패해도 끝난 모델은 남고 다시 실행하면 건너뛴다(--rerun이면 다시 돌린다)
+    cache_dir = out_dir / "_cache"
+    cache_dir.mkdir(exist_ok=True)
     for name in models:
+        mask_paths = {p: out_dir / p.stem / f"{name}_mask.png" for p in images}
+        time_path = cache_dir / f"{name}.json"
+        if not args.rerun and time_path.is_file() and all(mp.is_file() for mp in mask_paths.values()):
+            cached = json.loads(time_path.read_text(encoding="utf-8"))
+            if all(p.name in cached["times"] for p in images):
+                masks[name] = {p: np.array(Image.open(mask_paths[p]).convert("L")) for p in images}
+                times[name] = {p: cached["times"][p.name] for p in images}
+                peak_mem[name] = cached.get("peak_mem_gb")
+                print(f"[{name}] 이전 결과 사용(다시 돌리려면 --rerun)")
+                continue
         print(f"[{name}] 로딩...")
         if device == "cuda":
             torch.cuda.empty_cache()
@@ -400,8 +420,12 @@ def main() -> None:
             masks[name][path] = model.mask(originals[path])
             sync(device)
             times[name][path] = (time.perf_counter() - start) * 1000
+            mask_paths[path].parent.mkdir(exist_ok=True)
+            Image.fromarray(masks[name][path]).save(mask_paths[path])
             print(f"[{name}] {path.name}: {times[name][path]:.0f} ms")
         peak_mem[name] = torch.cuda.max_memory_allocated() / 2**30 if device == "cuda" else None
+        time_path.write_text(json.dumps({"times": {p.name: t for p, t in times[name].items()},
+                                         "peak_mem_gb": peak_mem[name]}), encoding="utf-8")
         del model
         gc.collect()
         if device == "cuda":
@@ -416,7 +440,6 @@ def main() -> None:
         results = {}
         for name in models:
             raw = masks[name][path]
-            Image.fromarray(raw).save(item_dir / f"{name}_mask.png")
             cut = original.copy()
             cut.putalpha(Image.fromarray(postprocess(raw, args.blur_sigma)))
             cut.save(item_dir / f"{name}.png")

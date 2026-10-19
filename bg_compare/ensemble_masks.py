@@ -5,6 +5,8 @@ I = InSPyReNet(--base-i), B = BiRefNet_dynamic(--base-b) 마스크(0~1).
   ens_min      min(I, B)                         한쪽이 배경이라고 하면 지운다(I 잔상·B 침대 둘 다)
   ens_min_dil  min(I, B를 --dilate px 넓힌 것)     B가 놓친 머리카락 끝 같은 가는 부분은 I에서 살린다
   ens_boost    ens_min_dil + B ≥ 0.9인 곳에서 I×1.6  B가 확실히 전경인 곳의 I 반투명(뒤쪽 인물 유령)을 진하게
+  ens_clean    ens_min에서 확실한 전경(≥0.9)과 떨어진 반투명 덩어리만 지운다(베개·이불 잔상). 확실한 영역에서
+               --keep-px 안쪽은 그대로 두고, 그 밖은 거리에 따라 부드럽게 옅어진다 — 0/1로 자르지 않는다
 
 결과 폴더는 원본 결과 폴더와 같은 구조다(<컷>/original.jpg, <컷>/<이름>.png·_mask.png, sheets/, rate.html).
 후처리는 워커와 같다(--blur-sigma, 기본 1.5).
@@ -24,6 +26,7 @@ from PIL import Image, ImageDraw, ImageFilter
 
 BOOST_GATE = 0.9
 BOOST_GAIN = 1.6
+CORE = 0.9
 
 
 def load_mask(path: Path) -> np.ndarray:
@@ -41,14 +44,25 @@ def dilate(mask: np.ndarray, px: int) -> np.ndarray:
     return np.asarray(to_image(mask).filter(ImageFilter.MaxFilter(size)), dtype=np.float32) / 255
 
 
-def combine(i: np.ndarray, b: np.ndarray, dilate_px: int) -> dict:
+def near_core_gate(mask: np.ndarray, keep_px: int, fade_px: int) -> np.ndarray:
+    """확실한 전경(≥CORE)에서 keep_px 안쪽은 1, 그 밖은 약 fade_px에 걸쳐 0으로 매끄럽게 떨어지는 값(0~1)."""
+    core = to_image((mask >= CORE).astype(np.float32))
+    near = core.filter(ImageFilter.MaxFilter(keep_px * 2 + 1)) if keep_px > 0 else core
+    soft = np.asarray(near.filter(ImageFilter.GaussianBlur(fade_px / 2)), dtype=np.float32) / 255
+    t = np.clip(soft / 0.5, 0, 1)  # 넓힌 영역 경계(0.5)부터 안쪽은 1
+    return t * t * (3 - 2 * t)      # smoothstep — 꺾임 없이 옅어진다
+
+
+def combine(i: np.ndarray, b: np.ndarray, dilate_px: int, keep_px: int, fade_px: int) -> dict:
     b_dil = dilate(b, dilate_px)
     min_dil = np.minimum(i, b_dil)
     boosted = np.where(b >= BOOST_GATE, np.clip(i * BOOST_GAIN, 0, 1), i)
+    ens_min = np.minimum(i, b)
     return {
-        "ens_min": np.minimum(i, b),
+        "ens_min": ens_min,
         "ens_min_dil": min_dil,
         "ens_boost": np.minimum(boosted, b_dil),
+        "ens_clean": ens_min * near_core_gate(ens_min, keep_px, fade_px),
     }
 
 
@@ -106,6 +120,9 @@ def main() -> None:
     parser.add_argument("--base-b", default="birefnet_dynamic")
     parser.add_argument("--dilate", type=int, default=15, help="ens_min_dil·ens_boost에서 B를 넓히는 px")
     parser.add_argument("--blur-sigma", type=float, default=1.5)
+    parser.add_argument("--keep-px", type=int, default=30, help="ens_clean: 확실한 전경에서 그대로 두는 거리(px)")
+    parser.add_argument("--fade-px", type=int, default=24, help="ens_clean: 그 밖에서 옅어지는 폭(px)")
+    parser.add_argument("--only", default=None, help="쉼표로 컷 이름을 주면 그 컷만(빠른 확인용)")
     parser.add_argument("--per-sheet", type=int, default=4, help="한눈 보기 시트 한 장의 컷 수")
     args = parser.parse_args()
 
@@ -116,9 +133,12 @@ def main() -> None:
     missing = [p.name for p in cuts if not (p / f"{args.base_b}_mask.png").is_file() or not (p / "original.jpg").is_file()]
     if not cuts or missing:
         parser.error(f"마스크·원본이 없는 컷이 있습니다: {missing[:5] or '컷 없음'}")
+    if args.only:
+        wanted = set(args.only.split(","))
+        cuts = [c for c in cuts if c.name in wanted]
     (dst / "sheets").mkdir(parents=True, exist_ok=True)
 
-    shown = [args.base_i, args.base_b, "ens_min", "ens_min_dil", "ens_boost"]
+    shown = [args.base_i, args.base_b, "ens_min", "ens_clean"]
     rows = []
     for d in cuts:
         out = dst / d.name
@@ -128,7 +148,7 @@ def main() -> None:
         i, b = load_mask(d / f"{args.base_i}_mask.png"), load_mask(d / f"{args.base_b}_mask.png")
         if i.shape != b.shape or i.shape != (original.height, original.width):
             raise RuntimeError(f"{d.name}: 마스크·원본 크기가 다릅니다 {i.shape} {b.shape} {original.size}")
-        masks = {args.base_i: i, args.base_b: b, **combine(i, b, args.dilate)}
+        masks = {args.base_i: i, args.base_b: b, **combine(i, b, args.dilate, args.keep_px, args.fade_px)}
         cutouts = {}
         for name, mask in masks.items():
             mask_img = to_image(mask)

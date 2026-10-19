@@ -4,6 +4,15 @@
 프로젝트 코드와 무관한 단독 스크립트다. 같은 이미지를 모델마다 돌려 결과·마스크·비교 시트·처리 시간을 남긴다.
 후처리는 현재 워커와 같다(blur_sigma > 0이면 마스크에 가우시안 블러, 0이면 127 이진화) — 모델 차이만 보이게.
 
+모델(--models, 쉼표 구분):
+  inspyrenet          현재 워커와 같음(1024로 줄여 추론)
+  inspyrenet_dynamic  InSPyReNet을 원본 해상도에 맞춰 추론
+  birefnet            예전 워커와 같음(1024)
+  birefnet_hr         BiRefNet 고해상도판(2048)
+  birefnet_dynamic    BiRefNet 가변 해상도판(원본 크기, 긴 변 2560 이하)
+  toonout             BiRefNet 애니 추가 학습판(--toonout-weights 필요)
+  어느 이름이든 뒤에 +tta를 붙이면 좌우 반전 TTA(예: birefnet_hr+tta)
+
 사용 예:
   python compare_bg_removal.py --input ./samples --output ./out
   python compare_bg_removal.py --input ./samples --output ./out --models inspyrenet,birefnet,birefnet_hr
@@ -16,6 +25,8 @@
   sheets/<이미지명>.jpg         원본 | 모델별 결과(바둑판 위) / 모델별 마스크 비교 시트
   timings.csv                   이미지·모델별 처리 시간(ms)
   index.html                    시트 모아 보기
+  rate.html                     블라인드 평가 — 모델 이름을 가리고 컷마다 가장 나은 결과를 고른다(키: 1~9 선택, 0 비슷함,
+                                X 모두 나쁨, B 배경 바꾸기, ←/→ 이동). 선택은 브라우저에 저장되고 '결과 보기'에서 득표를 본다
 """
 
 import argparse
@@ -76,13 +87,19 @@ def checkerboard(size, cell: int = 16) -> Image.Image:
 class InSPyReNetModel:
     """현재 워커와 같은 방식 — transparent-background Remover, type='map'."""
 
-    def __init__(self, device: str, mode: str, ckpt: Optional[str]):
+    def __init__(self, device: str, mode: str, ckpt: Optional[str], resize: str = "static"):
         from transparent_background import Remover
         kwargs = {"mode": mode, "device": device}
         # 워커는 S3에서 받은 ckpt_base.pth를 쓴다. 안 주면 패키지가 같은 base 가중치를 직접 내려받는다
         if ckpt:
             kwargs["ckpt"] = ckpt
-        self.remover = Remover(**kwargs)
+        # static(워커와 같음): 1024로 줄여 추론 / dynamic: 원본 해상도에 맞춰 추론(고해상도 경계에 유리)
+        if resize != "static":
+            kwargs["resize"] = resize
+        try:
+            self.remover = Remover(**kwargs)
+        except TypeError as exc:
+            raise RuntimeError(f"이 transparent-background 버전은 resize='{resize}'를 받지 않습니다: {exc}") from exc
 
     def mask(self, image: Image.Image) -> np.ndarray:
         return np.array(self.remover.process(image, type="map").convert("L"))
@@ -107,7 +124,10 @@ def _patch_transformers_for_birefnet() -> None:
 class BiRefNetModel:
     """BiRefNet(Hugging Face 원격 코드). weights를 주면 같은 구조에 그 가중치를 덮어쓴다(ToonOut 등)."""
 
-    def __init__(self, device: str, repo: str, resolution: int, fp16: bool, weights: Optional[str] = None):
+    # resolution=None이면 원본 크기(32의 배수, 긴 변 NATIVE_MAX_SIDE 이하)로 추론한다 — BiRefNet_dynamic용
+    NATIVE_MAX_SIDE = 2560
+
+    def __init__(self, device: str, repo: str, resolution: Optional[int], fp16: bool, weights: Optional[str] = None):
         _patch_transformers_for_birefnet()
         from transformers import AutoModelForImageSegmentation
         from torchvision import transforms
@@ -129,27 +149,57 @@ class BiRefNetModel:
         self.dtype = torch.float16 if (fp16 and device == "cuda") else torch.float32
         self.model = model.to(device=device, dtype=self.dtype).eval()
         self.device = device
-        self.to_tensor = transforms.Compose([
-            transforms.Resize((resolution, resolution)),
-            transforms.ToTensor(),
-            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-        ])
+        self.resolution = resolution
+        self.transforms = transforms
         self.to_pil = transforms.ToPILImage()
 
+    def _input_size(self, image: Image.Image):
+        if self.resolution:
+            return self.resolution, self.resolution
+        scale = min(1.0, self.NATIVE_MAX_SIDE / max(image.size))
+        w, h = (max(32, round(v * scale / 32) * 32) for v in image.size)
+        return h, w
+
     def mask(self, image: Image.Image) -> np.ndarray:
-        x = self.to_tensor(image).unsqueeze(0).to(device=self.device, dtype=self.dtype)
+        t = self.transforms
+        to_tensor = t.Compose([
+            t.Resize(self._input_size(image)),
+            t.ToTensor(),
+            t.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])
+        x = to_tensor(image).unsqueeze(0).to(device=self.device, dtype=self.dtype)
         with torch.no_grad():
             pred = self.model(x)[-1].sigmoid().float().cpu()[0].squeeze()
         return np.array(self.to_pil(pred).resize(image.size, Image.BILINEAR))
 
 
+class FlipTTA:
+    """좌우 반전 TTA — 원본과 반전 이미지의 마스크를 평균한다(한쪽에서만 틀린 잡음·잔상이 줄어든다)."""
+
+    def __init__(self, model):
+        self.model = model
+
+    def mask(self, image: Image.Image) -> np.ndarray:
+        plain = self.model.mask(image).astype(np.float32)
+        flipped = self.model.mask(image.transpose(Image.FLIP_LEFT_RIGHT))[:, ::-1].astype(np.float32)
+        return np.clip((plain + flipped) / 2, 0, 255).astype(np.uint8)
+
+
+TTA_SUFFIX = "+tta"
+
+
 def build_loaders(args, device: str) -> Dict[str, Callable[[], object]]:
-    return {
+    base = {
         "inspyrenet": lambda: InSPyReNetModel(device, args.inspyrenet_mode, args.inspyrenet_ckpt),
+        "inspyrenet_dynamic": lambda: InSPyReNetModel(device, args.inspyrenet_mode, args.inspyrenet_ckpt, resize="dynamic"),
         "birefnet": lambda: BiRefNetModel(device, "ZhengPeng7/BiRefNet", 1024, args.fp16),
         "birefnet_hr": lambda: BiRefNetModel(device, "ZhengPeng7/BiRefNet_HR", 2048, args.fp16),
+        "birefnet_dynamic": lambda: BiRefNetModel(device, "ZhengPeng7/BiRefNet_dynamic", None, args.fp16),
         "toonout": lambda: BiRefNetModel(device, "ZhengPeng7/BiRefNet", 1024, args.fp16, weights=args.toonout_weights),
     }
+    # 어느 모델이든 이름 뒤에 +tta를 붙이면 좌우 반전 TTA로 돌린다(예: birefnet_hr+tta)
+    with_tta = {f"{name}{TTA_SUFFIX}": (lambda make=make: FlipTTA(make())) for name, make in base.items()}
+    return {**base, **with_tta}
 
 
 # ── 비교 시트 ───────────────────────────────────────────────────────────
@@ -198,6 +248,99 @@ def write_index(out_dir: Path, rows: List[dict], models: List[str]) -> None:
     )
 
 
+RATE_PAGE = r"""<!doctype html><meta charset="utf-8"><title>배경 제거 블라인드 평가</title>
+<style>
+  :root{--bg:#f4f4f6;--fg:#1d1d22;--muted:#6b6b76;--line:#d9d9e0;--accent:#5b43dc}
+  body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+  header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;padding:12px 16px;border-bottom:1px solid var(--line);background:#fff;position:sticky;top:0}
+  header b{font-size:15px} .muted{color:var(--muted);font-size:13px}
+  button{font:inherit;border:1px solid var(--line);background:#fff;border-radius:8px;padding:6px 12px;cursor:pointer}
+  button.on{border-color:var(--accent);background:#efebff;color:var(--accent);font-weight:600}
+  main{padding:16px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
+  figure{margin:0;background:#fff;border:2px solid var(--line);border-radius:10px;overflow:hidden;cursor:pointer}
+  figure.picked{border-color:var(--accent);box-shadow:0 0 0 3px #e2dbff}
+  figcaption{padding:8px 10px;font-weight:600;display:flex;justify-content:space-between}
+  .stage{display:flex;align-items:center;justify-content:center;height:62vh}
+  .stage img{max-width:100%;max-height:100%;display:block}
+  .checker{background:repeating-conic-gradient(#e2e2e8 0 25%,#fff 0 50%) 0 0/20px 20px}
+  .black{background:#000}.white{background:#fff}.magenta{background:#ff00c8}
+  table{border-collapse:collapse;margin-top:12px;background:#fff}td,th{border:1px solid var(--line);padding:6px 12px;text-align:left}
+</style>
+<header>
+  <b>배경 제거 블라인드 평가</b><span id="pos" class="muted"></span>
+  <span class="muted">배경</span><span id="bgs"></span>
+  <button id="prev">← 이전</button><button id="next">다음 →</button>
+  <button id="tie">비슷함 (0)</button><button id="bad">모두 나쁨 (X)</button>
+  <button id="show">결과 보기</button>
+</header>
+<main id="main"></main>
+<script>
+const DATA = __DATA__;
+const KEY = 'bg-rate:' + location.pathname;
+const BGS = ['checker', 'black', 'white', 'magenta'];
+let votes = {}, idx = 0, bg = 'checker';
+try { votes = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch (e) { votes = {}; }
+const save = () => { try { localStorage.setItem(KEY, JSON.stringify(votes)); } catch (e) {} };
+// 컷마다 정해진 순서로 섞는다(다시 열어도 같은 글자) — 모델 이름은 결과 보기 전까지 숨긴다
+function order(stem) {
+  let h = 0; for (const c of stem) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  const arr = DATA.models.slice();
+  for (let i = arr.length - 1; i > 0; i--) { h = (h * 1103515245 + 12345) >>> 0; const j = h % (i + 1); [arr[i], arr[j]] = [arr[j], arr[i]]; }
+  return arr;
+}
+const letter = i => String.fromCharCode(65 + i);
+function render() {
+  const cut = DATA.cuts[idx], models = order(cut);
+  document.getElementById('pos').textContent = `${idx + 1} / ${DATA.cuts.length} · ${cut} · 평가 ${Object.keys(votes).length}`;
+  document.getElementById('bgs').innerHTML = BGS.map(b => `<button class="${b === bg ? 'on' : ''}" data-bg="${b}">${b}</button>`).join(' ');
+  const pick = votes[cut];
+  const cards = [`<figure><figcaption>원본</figcaption><div class="stage white"><img src="${cut}/original.jpg"></div></figure>`]
+    .concat(models.map((m, i) => `<figure data-model="${m}" class="${pick === m ? 'picked' : ''}"><figcaption><span>${letter(i)}</span><span class="muted">${i + 1}</span></figcaption>
+      <div class="stage ${bg}"><img src="${cut}/${encodeURIComponent(m)}.png"></div></figure>`));
+  document.getElementById('main').innerHTML = `<div class="grid">${cards.join('')}</div>`;
+  document.getElementById('tie').className = pick === 'tie' ? 'on' : '';
+  document.getElementById('bad').className = pick === 'bad' ? 'on' : '';
+}
+function vote(v) { const cut = DATA.cuts[idx]; votes[cut] = votes[cut] === v ? undefined : v; if (!votes[cut]) delete votes[cut]; save(); if (votes[cut] && idx < DATA.cuts.length - 1) idx++; render(); }
+function results() {
+  const tally = Object.fromEntries([...DATA.models, 'tie', 'bad'].map(k => [k, 0]));
+  Object.values(votes).forEach(v => { if (v in tally) tally[v]++; });
+  const rows = Object.entries(tally).map(([k, n]) => `<tr><td>${k === 'tie' ? '비슷함' : k === 'bad' ? '모두 나쁨' : k}</td><td>${n}</td></tr>`).join('');
+  const csv = 'cut,choice\n' + DATA.cuts.map(c => `${c},${votes[c] || ''}`).join('\n');
+  const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+  document.getElementById('main').innerHTML = `<h2>결과 (평가 ${Object.keys(votes).length} / ${DATA.cuts.length})</h2>
+    <table><tr><th>선택</th><th>컷 수</th></tr>${rows}</table><p><a href="${url}" download="ratings.csv">컷별 선택 CSV 받기</a> · <button id="back">평가로 돌아가기</button></p>`;
+  document.getElementById('back').onclick = render;
+}
+document.addEventListener('click', e => {
+  const b = e.target.closest('[data-bg]'); if (b) { bg = b.dataset.bg; render(); return; }
+  const f = e.target.closest('figure[data-model]'); if (f) vote(f.dataset.model);
+});
+document.getElementById('prev').onclick = () => { idx = Math.max(0, idx - 1); render(); };
+document.getElementById('next').onclick = () => { idx = Math.min(DATA.cuts.length - 1, idx + 1); render(); };
+document.getElementById('tie').onclick = () => vote('tie');
+document.getElementById('bad').onclick = () => vote('bad');
+document.getElementById('show').onclick = results;
+document.addEventListener('keydown', e => {
+  const models = order(DATA.cuts[idx]);
+  if (e.key === 'ArrowLeft') document.getElementById('prev').click();
+  else if (e.key === 'ArrowRight') document.getElementById('next').click();
+  else if (e.key === '0') vote('tie');
+  else if (e.key.toLowerCase() === 'x') vote('bad');
+  else if (e.key.toLowerCase() === 'b') { bg = BGS[(BGS.indexOf(bg) + 1) % BGS.length]; render(); }
+  else if (/^[1-9]$/.test(e.key) && models[+e.key - 1]) vote(models[+e.key - 1]);
+});
+render();
+</script>"""
+
+
+def write_rate_page(out_dir: Path, stems: List[str], models: List[str]) -> None:
+    import json
+    data = json.dumps({"cuts": stems, "models": models}, ensure_ascii=False)
+    (out_dir / "rate.html").write_text(RATE_PAGE.replace("__DATA__", data), encoding="utf-8")
+
+
 # ── 실행 ────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -222,7 +365,7 @@ def main() -> None:
     unknown = [m for m in models if m not in loaders]
     if unknown:
         parser.error(f"모르는 모델: {unknown} (가능: {list(loaders)})")
-    if "toonout" in models and not args.toonout_weights:
+    if any(m.startswith("toonout") for m in models) and not args.toonout_weights:
         parser.error("toonout을 비교하려면 --toonout-weights가 필요합니다")
 
     src = Path(args.input)
@@ -269,6 +412,7 @@ def main() -> None:
         original = originals[path]
         item_dir = out_dir / path.stem
         item_dir.mkdir(exist_ok=True)
+        original.save(item_dir / "original.jpg", quality=95)  # 평가 페이지에서 나란히 본다
         results = {}
         for name in models:
             raw = masks[name][path]
@@ -288,6 +432,7 @@ def main() -> None:
         for r in rows:
             writer.writerow({"image": r["image"], **{m: f"{r[m]:.1f}" for m in models}})
     write_index(out_dir, rows, models)
+    write_rate_page(out_dir, [p.stem for p in images], models)
 
     print("\n요약")
     for name in models:

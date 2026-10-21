@@ -26,9 +26,11 @@
 
 결과(--output 아래):
   <이미지명>/x<배율>/<모델>.png   업스케일 결과
-  sheets/<이미지명>_x<배율>.jpg    디테일이 많은 구간을 골라 1:1로 자른 뒤 --zoom배(픽셀 그대로) 키워 모델별로 나란히 놓은 비교본
+  sheets/<이미지명>_x<배율>.png    디테일이 많은 구간을 골라 1:1로 자른 뒤 --zoom배(픽셀 그대로) 키워 모델별로 나란히 놓은 비교본
+                                   (PNG 무손실 — JPEG로 저장하면 압축이 모델 차이를 덮는다). 이 폴더만 가져가도 비교할 수 있다
   metrics.csv                      이미지·배율·모델별 처리 시간, 원본 일치도, 선명도(--gt면 정답 PSNR)
   compare.html                     뷰어 — 1~8배 확대(픽셀 그대로), 두 칸 동기 스크롤, Space로 A↔B 전환, 이름 가리기
+                                   (옆의 결과 PNG를 상대 경로로 읽으므로 --output 폴더째 옮겨야 열린다)
 
 지표 읽는 법:
   원본 일치도  결과를 입력 크기로 다시 줄여 입력과 비교한 PSNR(dB). 높을수록 입력 내용을 덜 바꿨다는 뜻이고,
@@ -539,6 +541,8 @@ def main() -> None:
         parser.error("--tile은 --tile-overlap의 두 배보다 커야 합니다")
 
     src = Path(args.input)
+    if not src.exists():
+        parser.error(f"--input 경로가 없습니다: {src.resolve()}")
     images = [src] if src.is_file() else sorted(p for p in src.iterdir() if p.suffix.lower() in IMAGE_EXTS)
     if not images:
         parser.error(f"이미지가 없습니다: {src}")
@@ -626,7 +630,7 @@ def main() -> None:
         boxes = detail_windows(job.src, max(8, round(args.crop * job.src.width / job.target[0])), args.crops)
         title = f"{job.stem}  x{scale_label(job.scale)}  {job.src.width}x{job.src.height} -> {job.target[0]}x{job.target[1]}"
         make_sheet(title, job.src, columns, boxes, args.zoom).save(
-            out_dir / "sheets" / f"{job.stem}_x{scale_label(job.scale)}.jpg", quality=92)
+            out_dir / "sheets" / f"{job.stem}_x{scale_label(job.scale)}.png")
 
         items.append({"id": job.key, "stem": job.stem, "scale": scale_label(job.scale),
                       "w": job.target[0], "h": job.target[1], "inW": job.src.width, "inH": job.src.height,
@@ -657,7 +661,8 @@ def main() -> None:
     for m in models:
         if peak_mem.get(m) is not None:
             print(f"  {m}: 최대 GPU 메모리 {peak_mem[m]:.2f} GB")
-    print(f"결과: {out_dir.resolve()} (compare.html을 브라우저로 열어 보세요)")
+    print(f"\n비교 시트: {(out_dir / 'sheets').resolve()} ({len(items)}장)")
+    print(f"뷰어: {(out_dir / 'compare.html').resolve()} (--output 폴더째 옮겨서 열기)")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,105 @@
+pipeline {
+  agent any
+  
+  environment {
+    AI_STUDIO_PLATFORM_AWS_ACCESS_KEY=credentials('AI_STUDIO_PLATFORM_AWS_ACCESS_KEY')
+    AI_STUDIO_PLATFORM_AWS_SECRET_ACCESS_KEY=credentials('AI_STUDIO_PLATFORM_AWS_SECRET_ACCESS_KEY')
+    AWS_PLATFORM_ECR_REGION='ap-northeast-2'
+    AWS_ECR_REGISTRY=credentials('AWS_ECR_REGISTRY')
+    AWS_ECR_REPOSITORY_NAME=credentials('AWS_ECR_REPOSITORY_NAME')
+    AWS_ECR_REPOSITORY=credentials('AWS_ECR_REPOSITORY')
+    QA_SERVER_HOST=credentials('QA_SERVER_HOST')
+    QA_SERVER_USER=credentials('QA_SERVER_USER')
+    QA_SERVER_PASSWORD=credentials('QA_SERVER_PASSWORD')
+    BRANCH_NAME="${params.BRANCH_NAME}"
+    AI_STUDIO_API_URL="${params.AI_STUDIO_API_URL}"
+    PROFILE_NAME="${params.PROFILE_NAME}".toLowerCase()
+    INTERVIEWER_API_KEY=credentials('INTERVIEWER_API_KEY')
+  }
+
+  stages {
+    stage('Inputs') {
+      steps {
+        script {
+          env.CONVERT_BRANCH_NAME = env.BRANCH_NAME.replace('/', '-')
+          env.DOCKER_IMAGE_TAG = "qa-devlab-${env.CONVERT_BRANCH_NAME}"
+          env.DOCKER_IMAGE_NAME = "${env.AWS_ECR_REGISTRY}/${env.AWS_ECR_REPOSITORY_NAME}:${env.DOCKER_IMAGE_TAG}"
+        }
+      }
+    }
+    
+    stage('Checkout') {
+        steps {
+          script {
+                git branch: env.BRANCH_NAME, 
+                url: 'https://github.com/ToomicsDev/toomics-devlab-frontend',
+                credentialsId: '37a8a709-bb92-4aab-bf72-045107d1fe82'
+            }
+        }
+    }
+    
+    stage('Build Docker Image') {
+        steps {
+            sh """
+                export AWS_ACCESS_KEY_ID=${env.AI_STUDIO_PLATFORM_AWS_ACCESS_KEY}
+                export AWS_SECRET_ACCESS_KEY=${env.AI_STUDIO_PLATFORM_AWS_SECRET_ACCESS_KEY}
+                export AWS_DEFAULT_REGION=${env.AWS_PLATFORM_ECR_REGION}
+                aws ecr get-login-password --region ${env.AWS_PLATFORM_ECR_REGION} | docker login --username AWS --password-stdin ${env.AWS_ECR_REGISTRY}
+
+                docker build --platform linux/amd64 --build-arg ENVIRONMENT=qa --build-arg AI_STUDIO_API_URL=${env.AI_STUDIO_API_URL} --build-arg PROFILE_NAME=${env.PROFILE_NAME} --build-arg INTERVIEWER_API_KEY=${env.INTERVIEWER_API_KEY} -t ${env.DOCKER_IMAGE_NAME} .
+                docker push ${env.DOCKER_IMAGE_NAME}
+            """
+        }
+    }
+    
+    stage('Deploy QA') {
+      steps {
+        script {
+          def sshCommand = """
+            apt-get install sshpass
+            sshpass -p ${env.QA_SERVER_PASSWORD} ssh -o StrictHostKeyChecking=no ${env.QA_SERVER_USER}@${env.QA_SERVER_HOST} "bash -s" << 'ENDSSH'
+              export AWS_ACCESS_KEY_ID=${env.AI_STUDIO_PLATFORM_AWS_ACCESS_KEY}
+              export AWS_SECRET_ACCESS_KEY=${env.AI_STUDIO_PLATFORM_AWS_SECRET_ACCESS_KEY}
+              export AWS_DEFAULT_REGION=${env.AWS_PLATFORM_ECR_REGION}
+              aws ecr get-login-password --region ${env.AWS_PLATFORM_ECR_REGION} | docker login --username AWS --password-stdin ${env.AWS_ECR_REGISTRY}
+
+              docker pull ${env.DOCKER_IMAGE_NAME}
+
+              if [ -n "\$(docker ps -a --format '{{.Names}}' | grep -x ${env.DOCKER_IMAGE_TAG})" ]; then
+                CURRENT_DOCKER_PORT=\$(docker inspect -f '{{json .NetworkSettings.Ports}}' ${env.DOCKER_IMAGE_TAG} | jq -r '.[][].HostPort' | sort -u | head -n 1)
+
+                docker stop ${env.DOCKER_IMAGE_TAG}
+                docker rm ${env.DOCKER_IMAGE_TAG}
+
+                docker run -d -p \${CURRENT_DOCKER_PORT}:3000 --name ${env.DOCKER_IMAGE_TAG} ${env.DOCKER_IMAGE_NAME}
+              else
+                docker run -d -p 30100-30199:3000 --name ${env.DOCKER_IMAGE_TAG} ${env.DOCKER_IMAGE_NAME}
+              fi
+
+              CURRENT_DOCKER_PORT=\$(docker inspect -f '{{json .NetworkSettings.Ports}}' ${env.DOCKER_IMAGE_TAG} | jq -r '.[][].HostPort' | sort -u | head -n 1)
+              echo "PORT:\${CURRENT_DOCKER_PORT}"
+          """
+          def portOutput = sh(script: sshCommand, returnStdout: true).trim().split('\n').find { it.startsWith('PORT:') }
+          env.CURRENT_DOCKER_PORT = portOutput?.replace('PORT:', '').trim()
+          echo "CURRENT_DOCKER_PORT is set to ${env.CURRENT_DOCKER_PORT}"
+        }
+      }
+    }
+  }
+  post {
+        success {
+            slackSend (
+                channel: '#noti_dev_차세대개발', 
+                color: '#00FF00', 
+                message: "DEVLAB QA URL: http://qa-platform.toomics.com:${env.CURRENT_DOCKER_PORT}"
+            )
+        }
+        
+        always {
+          script {
+            echo "CURRENT WORKSPACE = ${env.WORKSPACE}"
+            deleteDir()
+          }
+        }
+    }
+}	

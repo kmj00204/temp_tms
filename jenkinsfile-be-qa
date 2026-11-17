@@ -1,0 +1,362 @@
+pipeline {
+    agent any
+
+    // 파라미터 정의 — Jenkins UI에 드롭다운으로 표시됨
+    parameters {
+        choice(name: 'PROFILE_NAME', choices: ['PLATFORM', 'CONTENTS'], description: '프로필 선택')
+        string(name: 'BRANCH_NAME', description: '배포할 브랜치 명을 입력해주세요.')
+        choice(name: 'DB_TARGET', choices: ['AWS', 'LEGACY'], description: 'DB 선택: LEGACY(기존 사내DB) / AWS(신규 AWS 로컬DB)')
+    }
+
+    environment {
+        AI_STUDIO_PLATFORM_AWS_ACCESS_KEY         = credentials('AI_STUDIO_PLATFORM_AWS_ACCESS_KEY')
+        AI_STUDIO_PLATFORM_AWS_SECRET_ACCESS_KEY  = credentials('AI_STUDIO_PLATFORM_AWS_SECRET_ACCESS_KEY')
+        AI_STUDIO_CONTENTS_AWS_ACCESS_KEY         = credentials('AI_STUDIO_CONTENTS_AWS_ACCESS_KEY')
+        AI_STUDIO_CONTENTS_AWS_SECRET_ACCESS_KEY  = credentials('AI_STUDIO_CONTENTS_AWS_SECRET_ACCESS_KEY')
+
+        AI_STUDIO_MASTER_API_KEY                  = credentials('AI_STUDIO_MASTER_API_KEY')
+        AI_STUDIO_AGENT_API_KEY                   = credentials('AI_STUDIO_AGENT_API_KEY')
+        AI_STUDIO_WORKER_API_KEY                  = credentials('AI_STUDIO_WORKER_API_KEY')
+        QA_JWT_SECRET_KEY                         = credentials('QA_JWT_SECRET_TOKENS')
+        INTERVIEWER_API_KEY                       = credentials('INTERVIEWER_API_KEY')
+        AI_STUDIO_GROK_API_KEY                    = credentials('AI_STUDIO_GROK_API_KEY')
+        AI_STUDIO_GROK_MODEL                      = credentials('AI_STUDIO_GROK_MODEL')
+        AI_STUDIO_GROK_URL                        = credentials('AI_STUDIO_GROK_URL')
+        AI_STUDIO_BYTEPLUS_ARK_API_KEY            = credentials('AI_STUDIO_BYTEPLUS_ARK_API_KEY')
+
+        AWS_PLATFORM_ECR_REGION           = 'ap-northeast-2'
+        AWS_PLATFORM_ECR_REGISTRY         = credentials('AWS_ECR_REGISTRY')
+        AWS_PLATFORM_ECR_REPOSITORY_NAME  = credentials('AWS_ECR_REPOSITORY_NAME')
+        AWS_PLATFORM_ECR_REPOSITORY       = credentials('AWS_ECR_REPOSITORY')
+
+        QA_SERVER_HOST                    = credentials('QA_SERVER_HOST')
+        QA_SERVER_USER                    = credentials('QA_SERVER_USER')
+        QA_SERVER_PASSWORD                = credentials('QA_SERVER_PASSWORD')
+
+        // 기존 사내 DB (LEGACY)
+        QA_DB_HOST                        = credentials('AI_STUDIO_QA_DB_HOST')
+        QA_DB_PORT                        = credentials('AI_STUDIO_QA_DB_PORT')
+        QA_DB_PASSWORD                    = credentials('AI_STUDIO_QA_DB_PASSWORD')
+
+        // 신규 AWS DB 설정 (AWS 모드 전용)
+        QA_AWS_DB_USER                    = credentials('AI_STUDIO_QA_AWS_DB_USER')
+        QA_AWS_DB_PASSWORD                = credentials('AI_STUDIO_QA_AWS_DB_PASSWORD')
+        QA_AWS_DB_NAME                    = credentials('AI_STUDIO_QA_AWS_DB_NAME')
+        QA_AWS_DB_PORT                    = credentials('AI_STUDIO_QA_AWS_DB_PORT')
+
+        // Worker API 서버 호스트 (= MariaDB가 설치된 서버)
+        WORKER_API_HOST_PLATFORM          = credentials('WORKER_API_HOST_PLATFORM')
+        WORKER_API_HOST_CONTENTS          = credentials('WORKER_API_HOST_CONTENTS')
+        WORKER_API_QA_PORT                = credentials('WORKER_API_QA_PORT')
+
+        BRANCH_NAME                       = "${params.BRANCH_NAME}"
+        CONVERT_BRANCH_NAME               = env.BRANCH_NAME.replace('/', '-')
+        SERVICE_NAME                      = "ai-studio"
+        PROFILE_NAME                      = "${params.PROFILE_NAME}".toLowerCase()
+
+        DOCKER_IMAGE_TAG                  = "qa-${env.SERVICE_NAME}-${env.CONVERT_BRANCH_NAME}"
+        DOCKER_IMAGE_NAME                 = "${env.AWS_PLATFORM_ECR_REGISTRY}/${env.AWS_PLATFORM_ECR_REPOSITORY_NAME}:${env.DOCKER_IMAGE_TAG}"
+
+        GIT_REPOSITORY_URL                = 'https://github.com/ToomicsDev/toomics-ai-studio'
+        JIRA_WEBHOOK_SECRET               = credentials('JIRA_WEBHOOK_SECRET')
+        JIRA_API_TOKEN                    = credentials('JIRA_API_TOKEN')
+        JIRA_EMAIL                        = credentials('JIRA_EMAIL')
+        
+        GOOGLE_SERVICE_ACCOUNT_FILE       = credentials('GOOGLE_SERVICE_ACCOUNT')
+        VIDEO_RESERVATION_WEBHOOK_SECRET  = credentials('VIDEO_RESERVATION_WEBHOOK_SECRET')
+    }
+
+    stages {
+        // DB 설정 분기 — DB_TARGET 파라미터에 따라 접속 정보 결정
+        stage('Set DB Config') {
+            steps {
+                script {
+                    if (params.DB_TARGET == 'AWS') {
+                        // AWS: Worker API 서버의 로컬 MariaDB 사용
+                        env.ACTIVE_DB_HOST     = env.PROFILE_NAME == 'platform'
+                            ? env.WORKER_API_HOST_PLATFORM
+                            : env.WORKER_API_HOST_CONTENTS
+                        env.ACTIVE_DB_PORT     = env.QA_AWS_DB_PORT
+                        env.ACTIVE_DB_USER     = env.QA_AWS_DB_USER
+                        env.ACTIVE_DB_PASSWORD = env.QA_AWS_DB_PASSWORD
+                        env.ACTIVE_DB_NAME     = env.QA_AWS_DB_NAME
+                    } else {
+                        // LEGACY: 기존 사내 DB 사용
+                        env.ACTIVE_DB_HOST     = env.QA_DB_HOST
+                        env.ACTIVE_DB_PORT     = env.QA_DB_PORT
+                        env.ACTIVE_DB_USER     = ''
+                        env.ACTIVE_DB_PASSWORD = env.QA_DB_PASSWORD
+                        env.ACTIVE_DB_NAME     = ''
+                    }
+
+                    echo "═══════════════════════════════════════"
+                    echo "✅ DB_TARGET  : ${params.DB_TARGET}"
+                    echo "✅ PROFILE    : ${env.PROFILE_NAME}"
+                    echo "✅ DB_HOST    : ${env.ACTIVE_DB_HOST}"
+                    echo "✅ DB_PORT    : ${env.ACTIVE_DB_PORT}"
+                    echo "═══════════════════════════════════════"
+                }
+            }
+        }
+
+        stage('Checkout') {
+            steps {
+                script {
+                    git branch: params.BRANCH_NAME,
+                        url: env.GIT_REPOSITORY_URL,
+                        credentialsId: '37a8a709-bb92-4aab-bf72-045107d1fe82'
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh """
+                    aws configure set aws_access_key_id ${env.AI_STUDIO_PLATFORM_AWS_ACCESS_KEY}
+                    aws configure set aws_secret_access_key ${env.AI_STUDIO_PLATFORM_AWS_SECRET_ACCESS_KEY}
+                    aws configure set default.region ${env.AWS_PLATFORM_ECR_REGION}
+                    aws ecr get-login-password --region ${env.AWS_PLATFORM_ECR_REGION} | docker login --username AWS --password-stdin ${env.AWS_PLATFORM_ECR_REGISTRY}
+
+                    docker build --platform linux/amd64 \
+                        --build-arg ENVIRONMENT=qa \
+                        --build-arg PROFILE=${env.PROFILE_NAME} \
+                        -f apps/${env.SERVICE_NAME}/Dockerfile -t ${env.DOCKER_IMAGE_NAME} .
+
+                    docker push ${env.DOCKER_IMAGE_NAME}
+                """
+            }
+        }
+
+        stage('Deploy QA') {
+            steps {
+                script {
+                    def awsAccessKeyId = env.PROFILE_NAME == 'platform' ? env.AI_STUDIO_PLATFORM_AWS_ACCESS_KEY : env.AI_STUDIO_CONTENTS_AWS_ACCESS_KEY
+                    def awsSecretAccessKey = env.PROFILE_NAME == 'platform' ? env.AI_STUDIO_PLATFORM_AWS_SECRET_ACCESS_KEY : env.AI_STUDIO_CONTENTS_AWS_SECRET_ACCESS_KEY
+
+                    def dbUserEnv = env.ACTIVE_DB_USER ? "-e DB_USER=${env.ACTIVE_DB_USER}" : ""
+                    def dbNameEnv = env.ACTIVE_DB_NAME ? "-e DB_NAME=${env.ACTIVE_DB_NAME}" : ""
+
+                    sh """
+                        apt-get install sshpass -y
+                        sshpass -p ${env.QA_SERVER_PASSWORD} ssh -o StrictHostKeyChecking=no ${env.QA_SERVER_USER}@${env.QA_SERVER_HOST} "mkdir -p ~/secrets && rm -rf ~/secrets/google-sheets-sa.json"
+                        cat "${env.GOOGLE_SERVICE_ACCOUNT_FILE}" | sshpass -p ${env.QA_SERVER_PASSWORD} ssh -o StrictHostKeyChecking=no ${env.QA_SERVER_USER}@${env.QA_SERVER_HOST} "cat > ~/secrets/google-sheets-sa.json"
+                    """
+
+                    def sshCommand = """
+                        apt-get install sshpass -y
+                        sshpass -p ${env.QA_SERVER_PASSWORD} ssh -o StrictHostKeyChecking=no ${env.QA_SERVER_USER}@${env.QA_SERVER_HOST} "bash -s" << 'ENDSSH'
+                        aws configure set aws_access_key_id ${env.AI_STUDIO_PLATFORM_AWS_ACCESS_KEY}
+                        aws configure set aws_secret_access_key ${env.AI_STUDIO_PLATFORM_AWS_SECRET_ACCESS_KEY}
+                        aws configure set default.region ${env.AWS_PLATFORM_ECR_REGION}
+                        aws ecr get-login-password --region ${env.AWS_PLATFORM_ECR_REGION} | docker login --username AWS --password-stdin ${env.AWS_PLATFORM_ECR_REGISTRY}
+
+                        docker pull ${env.DOCKER_IMAGE_NAME}
+
+                        if [ -n "\$(docker ps -a --format '{{.Names}}' | grep -x ${env.DOCKER_IMAGE_TAG})" ]; then
+                            CURRENT_DOCKER_PORT=\$(docker inspect -f '{{json .NetworkSettings.Ports}}' ${env.DOCKER_IMAGE_TAG} | jq -r '.[][].HostPort' | sort -u | head -n 1)
+                            docker stop ${env.DOCKER_IMAGE_TAG}
+                            docker rm ${env.DOCKER_IMAGE_TAG}
+
+                            docker run -d \\
+                                --name ${env.DOCKER_IMAGE_TAG} \\
+                                --log-opt max-size=200m \\
+                                --log-opt max-file=5 \\
+                                -p \${CURRENT_DOCKER_PORT}:8000 \\
+                                -e DB_HOST=${env.ACTIVE_DB_HOST} \\
+                                -e DB_PORT=${env.ACTIVE_DB_PORT} \\
+                                -e DB_PASSWORD=${env.ACTIVE_DB_PASSWORD} \\
+                                ${dbUserEnv} \\
+                                ${dbNameEnv} \\
+                                -e AWS_ACCESS_KEY_ID=${awsAccessKeyId} \\
+                                -e AWS_SECRET_ACCESS_KEY=${awsSecretAccessKey} \\
+                                -e PLATFORM_AWS_ACCESS_KEY_ID=${env.AI_STUDIO_PLATFORM_AWS_ACCESS_KEY} \\
+                                -e PLATFORM_AWS_SECRET_ACCESS_KEY=${env.AI_STUDIO_PLATFORM_AWS_SECRET_ACCESS_KEY} \\
+                                -e AI_STUDIO_MASTER_API_KEY=${env.AI_STUDIO_MASTER_API_KEY} \\
+                                -e AI_STUDIO_AGENT_API_KEY=${env.AI_STUDIO_AGENT_API_KEY} \\
+                                -e AI_STUDIO_WORKER_API_KEY=${env.AI_STUDIO_WORKER_API_KEY} \\
+                                -e JWT_SECRET_KEY=${env.QA_JWT_SECRET_KEY} \\
+                                -e INTERVIEWER_API_KEY=${env.INTERVIEWER_API_KEY} \\
+                                -e GROK_API_KEY=${env.AI_STUDIO_GROK_API_KEY} \\
+                                -e GROK_API_MODEL=${env.AI_STUDIO_GROK_MODEL} \\
+                                -e GROK_API_URL=${env.AI_STUDIO_GROK_URL} \\
+                                -e BYTEPLUS_ARK_API_KEY=${env.AI_STUDIO_BYTEPLUS_ARK_API_KEY} \\
+                                -e JIRA_WEBHOOK_SECRET=${env.JIRA_WEBHOOK_SECRET} \\
+                                -e JIRA_API_TOKEN=${env.JIRA_API_TOKEN} \\
+                                -e JIRA_EMAIL=${env.JIRA_EMAIL} \\
+                                -v \$HOME/secrets/google-sheets-sa.json:/app/secrets/google-sheets-sa.json:ro \\
+                                -e GOOGLE_SERVICE_ACCOUNT_FILE=/app/secrets/google-sheets-sa.json \\
+                                -e VIDEO_RESERVATION_WEBHOOK_SECRET=${env.VIDEO_RESERVATION_WEBHOOK_SECRET} \\
+                                ${env.DOCKER_IMAGE_NAME}
+                        else
+                            docker run -d \\
+                                --name ${env.DOCKER_IMAGE_TAG} \\
+                                --log-opt max-size=200m \\
+                                --log-opt max-file=5 \\
+                                -p 30200-30299:8000 \\
+                                -e DB_HOST=${env.ACTIVE_DB_HOST} \\
+                                -e DB_PORT=${env.ACTIVE_DB_PORT} \\
+                                -e DB_PASSWORD=${env.ACTIVE_DB_PASSWORD} \\
+                                ${dbUserEnv} \\
+                                ${dbNameEnv} \\
+                                -e AWS_ACCESS_KEY_ID=${awsAccessKeyId} \\
+                                -e AWS_SECRET_ACCESS_KEY=${awsSecretAccessKey} \\
+                                -e PLATFORM_AWS_ACCESS_KEY_ID=${env.AI_STUDIO_PLATFORM_AWS_ACCESS_KEY} \\
+                                -e PLATFORM_AWS_SECRET_ACCESS_KEY=${env.AI_STUDIO_PLATFORM_AWS_SECRET_ACCESS_KEY} \\
+                                -e AI_STUDIO_MASTER_API_KEY=${env.AI_STUDIO_MASTER_API_KEY} \\
+                                -e AI_STUDIO_AGENT_API_KEY=${env.AI_STUDIO_AGENT_API_KEY} \\
+                                -e AI_STUDIO_WORKER_API_KEY=${env.AI_STUDIO_WORKER_API_KEY} \\
+                                -e JWT_SECRET_KEY=${env.QA_JWT_SECRET_KEY} \\
+                                -e INTERVIEWER_API_KEY=${env.INTERVIEWER_API_KEY} \\
+                                -e GROK_API_KEY=${env.AI_STUDIO_GROK_API_KEY} \\
+                                -e GROK_API_MODEL=${env.AI_STUDIO_GROK_MODEL} \\
+                                -e GROK_API_URL=${env.AI_STUDIO_GROK_URL} \\
+                                -e BYTEPLUS_ARK_API_KEY=${env.AI_STUDIO_BYTEPLUS_ARK_API_KEY} \\
+                                -e JIRA_WEBHOOK_SECRET=${env.JIRA_WEBHOOK_SECRET} \\
+                                -e JIRA_API_TOKEN=${env.JIRA_API_TOKEN} \\
+                                -e JIRA_EMAIL=${env.JIRA_EMAIL} \\
+                                -v \$HOME/secrets/google-sheets-sa.json:/app/secrets/google-sheets-sa.json:ro \\
+                                -e GOOGLE_SERVICE_ACCOUNT_FILE=/app/secrets/google-sheets-sa.json \\
+                                -e VIDEO_RESERVATION_WEBHOOK_SECRET=${env.VIDEO_RESERVATION_WEBHOOK_SECRET} \\
+                                ${env.DOCKER_IMAGE_NAME}
+                        fi
+
+                        CURRENT_DOCKER_PORT=\$(docker inspect -f '{{json .NetworkSettings.Ports}}' ${env.DOCKER_IMAGE_TAG} | jq -r '.[][].HostPort' | sort -u | head -n 1)
+                        echo "PORT:\${CURRENT_DOCKER_PORT}"
+ENDSSH
+                    """
+                    def portOutput = sh(script: sshCommand, returnStdout: true).trim().split('\n').find { it.startsWith('PORT:') }
+                    env.CURRENT_DOCKER_PORT = portOutput?.replace('PORT:', '').trim()
+                    echo "CURRENT_DOCKER_PORT is set to ${env.CURRENT_DOCKER_PORT}"
+                }
+            }
+        }
+
+        stage('Deploy Platform Worker API') {
+            when {
+                expression { env.PROFILE_NAME == 'platform' }
+            }
+            steps {
+                script {
+                    def dbUserEnv = env.ACTIVE_DB_USER ? "-e DB_USER=${env.ACTIVE_DB_USER}" : ""
+                    def dbNameEnv = env.ACTIVE_DB_NAME ? "-e DB_NAME=${env.ACTIVE_DB_NAME}" : ""
+
+                    withCredentials([sshUserPrivateKey(credentialsId: 'toomics-ai-studio-key', keyFileVariable: 'SSH_KEY')]) {
+                        sh """
+                            ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ubuntu@${env.WORKER_API_HOST_PLATFORM} "mkdir -p /home/ubuntu/secrets && rm -rf /home/ubuntu/secrets/google-sheets-sa.json"
+                            cat "${env.GOOGLE_SERVICE_ACCOUNT_FILE}" | ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ubuntu@${env.WORKER_API_HOST_PLATFORM} "cat > /home/ubuntu/secrets/google-sheets-sa.json"
+                        """
+                        sh """
+                            ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ubuntu@${env.WORKER_API_HOST_PLATFORM} "bash -s" << 'ENDSSH'
+
+                            aws configure set aws_access_key_id ${env.AI_STUDIO_PLATFORM_AWS_ACCESS_KEY}
+                            aws configure set aws_secret_access_key ${env.AI_STUDIO_PLATFORM_AWS_SECRET_ACCESS_KEY}
+                            aws configure set default.region ${env.AWS_PLATFORM_ECR_REGION}
+
+                            aws ecr get-login-password --region ap-northeast-2 | docker login --username AWS --password-stdin ${env.AWS_PLATFORM_ECR_REGISTRY}
+
+                            docker pull ${env.DOCKER_IMAGE_NAME}
+
+                            docker stop worker-api-qa || true
+                            docker rm worker-api-qa || true
+
+                            docker run -d --name worker-api-qa \\
+                                -p ${env.WORKER_API_QA_PORT}:8000 \\
+                                --restart unless-stopped \\
+                                --log-opt max-size=100m \\
+                                --log-opt max-file=3 \\
+                                -e DB_HOST=${env.ACTIVE_DB_HOST} \\
+                                -e DB_PORT=${env.ACTIVE_DB_PORT} \\
+                                -e DB_PASSWORD=${env.ACTIVE_DB_PASSWORD} \\
+                                ${dbUserEnv} \\
+                                ${dbNameEnv} \\
+                                -e AWS_ACCESS_KEY_ID=${env.AI_STUDIO_PLATFORM_AWS_ACCESS_KEY} \\
+                                -e AWS_SECRET_ACCESS_KEY=${env.AI_STUDIO_PLATFORM_AWS_SECRET_ACCESS_KEY} \\
+                                -e PLATFORM_AWS_ACCESS_KEY_ID=${env.AI_STUDIO_PLATFORM_AWS_ACCESS_KEY} \\
+                                -e PLATFORM_AWS_SECRET_ACCESS_KEY=${env.AI_STUDIO_PLATFORM_AWS_SECRET_ACCESS_KEY} \\
+                                -e AI_STUDIO_MASTER_API_KEY=${env.AI_STUDIO_MASTER_API_KEY} \\
+                                -e AI_STUDIO_AGENT_API_KEY=${env.AI_STUDIO_AGENT_API_KEY} \\
+                                -e AI_STUDIO_WORKER_API_KEY=${env.AI_STUDIO_WORKER_API_KEY} \\
+                                -e JWT_SECRET_KEY=${env.QA_JWT_SECRET_KEY} \\
+                                -e INTERVIEWER_API_KEY=${env.INTERVIEWER_API_KEY} \\
+                                -e GROK_API_KEY=${env.AI_STUDIO_GROK_API_KEY} \\
+                                -e GROK_API_MODEL=${env.AI_STUDIO_GROK_MODEL} \\
+                                -e GROK_API_URL=${env.AI_STUDIO_GROK_URL} \\
+                                -e BYTEPLUS_ARK_API_KEY=${env.AI_STUDIO_BYTEPLUS_ARK_API_KEY} \\
+                                -v /home/ubuntu/secrets/google-sheets-sa.json:/app/secrets/google-sheets-sa.json:ro \\
+                                -e GOOGLE_SERVICE_ACCOUNT_FILE=/app/secrets/google-sheets-sa.json \\
+                                -e VIDEO_RESERVATION_WEBHOOK_SECRET=${env.VIDEO_RESERVATION_WEBHOOK_SECRET} \\
+                                ${env.DOCKER_IMAGE_NAME}
+
+                            echo "Worker API deployed on http://${env.WORKER_API_HOST_PLATFORM}:${env.WORKER_API_QA_PORT}"
+ENDSSH
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Deploy Contents Worker API') {
+            when {
+                expression { env.PROFILE_NAME == 'contents' }
+            }
+            steps {
+                script {
+                    def dbUserEnv = env.ACTIVE_DB_USER ? "-e DB_USER=${env.ACTIVE_DB_USER}" : ""
+                    def dbNameEnv = env.ACTIVE_DB_NAME ? "-e DB_NAME=${env.ACTIVE_DB_NAME}" : ""
+
+                    withCredentials([sshUserPrivateKey(credentialsId: 'toomics-ai-studio-contents-key', keyFileVariable: 'SSH_KEY')]) {
+                        sh """
+                            ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ubuntu@${env.WORKER_API_HOST_CONTENTS} "mkdir -p /home/ubuntu/secrets && rm -rf /home/ubuntu/secrets/google-sheets-sa.json"
+                            cat "${env.GOOGLE_SERVICE_ACCOUNT_FILE}" | ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ubuntu@${env.WORKER_API_HOST_CONTENTS} "cat > /home/ubuntu/secrets/google-sheets-sa.json"
+                        """
+                        sh """
+                            ssh -i \$SSH_KEY -o StrictHostKeyChecking=no ubuntu@${env.WORKER_API_HOST_CONTENTS} "bash -s" << 'ENDSSH'
+
+                            aws configure set aws_access_key_id ${env.AI_STUDIO_PLATFORM_AWS_ACCESS_KEY}
+                            aws configure set aws_secret_access_key ${env.AI_STUDIO_PLATFORM_AWS_SECRET_ACCESS_KEY}
+                            aws configure set default.region ${env.AWS_PLATFORM_ECR_REGION}
+
+                            aws ecr get-login-password --region ap-northeast-2 | docker login --username AWS --password-stdin ${env.AWS_PLATFORM_ECR_REGISTRY}
+
+                            docker pull ${env.DOCKER_IMAGE_NAME}
+
+                            docker stop worker-api-qa || true
+                            docker rm worker-api-qa || true
+
+                            docker run -d --name worker-api-qa \\
+                                -p ${env.WORKER_API_QA_PORT}:8000 \\
+                                --restart unless-stopped \\
+                                --log-opt max-size=100m \\
+                                --log-opt max-file=3 \\
+                                -e DB_HOST=${env.ACTIVE_DB_HOST} \\
+                                -e DB_PORT=${env.ACTIVE_DB_PORT} \\
+                                -e DB_PASSWORD=${env.ACTIVE_DB_PASSWORD} \\
+                                ${dbUserEnv} \\
+                                ${dbNameEnv} \\
+                                -e AWS_ACCESS_KEY_ID=${env.AI_STUDIO_CONTENTS_AWS_ACCESS_KEY} \\
+                                -e AWS_SECRET_ACCESS_KEY=${env.AI_STUDIO_CONTENTS_AWS_SECRET_ACCESS_KEY} \\
+                                -e PLATFORM_AWS_ACCESS_KEY_ID=${env.AI_STUDIO_PLATFORM_AWS_ACCESS_KEY} \\
+                                -e PLATFORM_AWS_SECRET_ACCESS_KEY=${env.AI_STUDIO_PLATFORM_AWS_SECRET_ACCESS_KEY} \\
+                                -e AI_STUDIO_MASTER_API_KEY=${env.AI_STUDIO_MASTER_API_KEY} \\
+                                -e AI_STUDIO_AGENT_API_KEY=${env.AI_STUDIO_AGENT_API_KEY} \\
+                                -e AI_STUDIO_WORKER_API_KEY=${env.AI_STUDIO_WORKER_API_KEY} \\
+                                -e JWT_SECRET_KEY=${env.QA_JWT_SECRET_KEY} \\
+                                -e INTERVIEWER_API_KEY=${env.INTERVIEWER_API_KEY} \\
+                                -e GROK_API_KEY=${env.AI_STUDIO_GROK_API_KEY} \\
+                                -e GROK_API_MODEL=${env.AI_STUDIO_GROK_MODEL} \\
+                                -e GROK_API_URL=${env.AI_STUDIO_GROK_URL} \\
+                                -e BYTEPLUS_ARK_API_KEY=${env.AI_STUDIO_BYTEPLUS_ARK_API_KEY} \\
+                                -v /home/ubuntu/secrets/google-sheets-sa.json:/app/secrets/google-sheets-sa.json:ro \\
+                                -e GOOGLE_SERVICE_ACCOUNT_FILE=/app/secrets/google-sheets-sa.json \\
+                                -e VIDEO_RESERVATION_WEBHOOK_SECRET=${env.VIDEO_RESERVATION_WEBHOOK_SECRET} \\
+                                ${env.DOCKER_IMAGE_NAME}
+
+                            echo "Worker API deployed on http://${env.WORKER_API_HOST_CONTENTS}:${env.WORKER_API_QA_PORT}"
+ENDSSH
+                        """
+                    }
+                }
+            }
+        }
+    }
+}
